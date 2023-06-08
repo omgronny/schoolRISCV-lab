@@ -27,6 +27,17 @@ module sr_cpu
     wire        wdSrc;
     wire  [2:0] aluControl;
 
+    // func
+    wire        funcBusy;
+    wire        funcIRQ;
+    wire [4:0]  funcRd;
+    wire [2:0]  funcControl;
+    wire [31:0] funcResult;
+ 
+    wire [2:0]  unitControl;
+    wire [31:0] unitResult;
+    wire        unitSelect;
+ 
     //instruction decode wires
     wire [ 6:0] cmdOp;
     wire [ 4:0] rd;
@@ -42,12 +53,24 @@ module sr_cpu
     wire [31:0] pc;
     wire [31:0] pcBranch = pc + immB;
     wire [31:0] pcPlus4  = pc + 4;
-    wire [31:0] pcNext   = pcSrc ? pcBranch : pcPlus4;
-    sm_register r_pc(clk ,rst_n, pcNext, pc);
+    wire [31:0] pcNext = funcBusy | funcIRQ ? pc : (pcSrc ? pcBranch : pcPlus4);
+ 
+    sm_register r_pc(
+        clk, 
+        rst_n,
+        pcNext,
+        pc
+    );
 
     //program memory access
     assign imAddr = pc >> 2;
-    wire [31:0] instr = imData;
+    wire [31:0] instr = funcBusy | funcIRQ ? `RVPE_NOP : imData;
+
+    wire [4:0]  proxyRd;
+    wire        proxyRegWrite;
+
+    assign proxyRd = funcIRQ ? funcRd : rd; 
+    assign proxyRegWrite = funcIRQ ? 1 : regWrite;
 
     //instruction decode
     sr_decode id (
@@ -74,12 +97,12 @@ module sr_cpu
         .a0         ( regAddr      ),
         .a1         ( rs1          ),
         .a2         ( rs2          ),
-        .a3         ( rd           ),
+        .a3         ( proxyRd      ),
         .rd0        ( rd0          ),
         .rd1        ( rd1          ),
         .rd2        ( rd2          ),
         .wd3        ( wd3          ),
-        .we3        ( regWrite     )
+        .we3        ( proxyRegWrite)
     );
 
     //debug register access
@@ -97,7 +120,7 @@ module sr_cpu
         .result     ( aluResult    ) 
     );
 
-    assign wd3 = wdSrc ? immU : aluResult;
+    assign wd3 = wdSrc ? immU : unitResult;
 
     //control
     sr_control sm_control (
@@ -109,7 +132,36 @@ module sr_cpu
         .regWrite   ( regWrite     ),
         .aluSrc     ( aluSrc       ),
         .wdSrc      ( wdSrc        ),
-        .aluControl ( aluControl   ) 
+        .aluControl ( aluControl   ), 
+        .unitControl( unitControl  ),
+        .unitSelect ( unitSelect   )
+    );
+
+    wire proxyUnitSelect;
+    assign proxyUnitSelect = funcIRQ ? 1 : unitSelect;
+
+    sr_unit_selector iselect (
+        .unit         ( proxyUnitSelect  ),
+        .aluControl   ( aluControl       ),
+        .aluResult    ( aluResult        ),
+        .funcControl  ( funcControl      ),
+        .funcBusy     ( funcBusy         ),
+        .funcResult   ( funcResult       ),
+        .unitControl  ( unitControl      ),
+        .unitResult   ( unitResult       )
+    );
+
+    func_unit fn_unit(
+        .clk     ( clk         ),
+        .rst     ( ~rst_n      ),
+        .rd_i    ( proxyRd     ),
+        .srcA    ( rd1         ),
+        .srcB    ( srcB        ),
+        .oper    ( funcControl ),
+        .result  ( funcResult  ),
+        .busy    ( funcBusy    ),
+        .irq     ( funcIRQ     ),
+        .rd_o    ( funcRd      )
     );
 
 endmodule
@@ -159,19 +211,23 @@ endmodule
 
 module sr_control
 (
-    input     [ 6:0] cmdOp,
-    input     [ 2:0] cmdF3,
-    input     [ 6:0] cmdF7,
+    input      [6:0] cmdOp,
+    input      [2:0] cmdF3,
+    input      [6:0] cmdF7,
     input            aluZero,
     output           pcSrc, 
     output reg       regWrite, 
     output reg       aluSrc,
     output reg       wdSrc,
-    output reg [2:0] aluControl
+    output reg [2:0] aluControl,
+    output reg [2:0] unitControl,
+    output reg       unitSelect
 );
-    reg          branch;
-    reg          condZero;
-    assign pcSrc = branch & (aluZero == condZero);
+    reg          branch   = 1'b0;
+    reg          opIsBGE  = 1'b0;
+    reg          condZero = 1'b0;
+
+    assign pcSrc = branch & (opIsBGE ? aluZero : (aluZero == condZero));
 
     always @ (*) begin
         branch      = 1'b0;
@@ -179,7 +235,10 @@ module sr_control
         regWrite    = 1'b0;
         aluSrc      = 1'b0;
         wdSrc       = 1'b0;
+        opIsBGE     = 1'b0;
         aluControl  = `ALU_ADD;
+        unitSelect  = 1'b0;
+        unitControl = `ALU_ADD;
 
         casez( {cmdF7, cmdF3, cmdOp} )
             { `RVF7_ADD,  `RVF3_ADD,  `RVOP_ADD  } : begin regWrite = 1'b1; aluControl = `ALU_ADD;  end
@@ -193,16 +252,20 @@ module sr_control
 
             { `RVF7_ANY,  `RVF3_BEQ,  `RVOP_BEQ  } : begin branch = 1'b1; condZero = 1'b1; aluControl = `ALU_SUB; end
             { `RVF7_ANY,  `RVF3_BNE,  `RVOP_BNE  } : begin branch = 1'b1; aluControl = `ALU_SUB; end
+
+            { `RVF7_ANY,  `RVF3_BGE,  `RVOP_BGE  } : begin branch = 1'b1; opIsBGE = 1'b1; aluControl = `ALU_SLTU; unitControl = `ALU_SLTU; end
+
+            { `RVF7_FUNC, `RVF3_FUNC, `RVOP_FUNC } : begin regWrite = 1'b1; unitControl = `FUNC_START; unitSelect = 1; end
         endcase
     end
 endmodule
 
 module sr_alu
 (
-    input  [31:0] srcA,
-    input  [31:0] srcB,
-    input  [ 2:0] oper,
-    output        zero,
+    input      [31:0] srcA,
+    input      [31:0] srcB,
+    input      [ 2:0] oper,
+    output            zero,
     output reg [31:0] result
 );
     always @ (*) begin
@@ -212,11 +275,42 @@ module sr_alu
             `ALU_OR   : result = srcA | srcB;
             `ALU_SRL  : result = srcA >> srcB [4:0];
             `ALU_SLTU : result = (srcA < srcB) ? 1 : 0;
-            `ALU_SUB : result = srcA - srcB;
+            `ALU_SUB  : result = srcA - srcB;
         endcase
     end
 
     assign zero   = (result == 0);
+endmodule
+
+module sr_unit_selector 
+(
+    input             unit,
+
+    output reg [ 2:0] aluControl,
+    input      [31:0] aluResult,
+
+    output reg [ 2:0] funcControl,
+    input      [31:0] funcResult,
+    input             funcBusy,
+
+    input      [ 2:0] unitControl,
+    output reg [31:0] unitResult 
+);
+    always @ (*)
+            case (unit)
+                1'b0: if (~funcBusy) begin
+                    unitResult   = aluResult;
+                    aluControl   = unitControl;
+                    funcControl  = `FUNC_IDLE;
+                end else begin 
+                    unitResult   = funcResult;
+                    funcControl  = 1'b1;
+                    end
+                1'b1: begin
+                    unitResult   = funcResult;
+                    funcControl  = unitControl;
+                end
+            endcase
 endmodule
 
 module sm_register_file
@@ -240,4 +334,82 @@ module sm_register_file
 
     always @ (posedge clk)
         if(we3) rf [a3] <= wd3;
+endmodule
+
+module func_unit
+(
+    input              clk,
+    input              rst,
+    input      [ 4:0]  rd_i,
+    input      [31:0]  srcA,
+    input      [31:0]  srcB,
+    input      [ 2:0]  oper,
+    output reg [31:0]  result,
+    output             busy,
+    output             irq,
+    output reg [ 4:0]  rd_o
+);
+ 
+    localparam IDLE = 1'b0;
+    localparam WORK = 1'b1;
+    
+    wire fn_busy;
+    
+    reg state = IDLE;
+    reg res_unsaved = 0;
+    reg rbusy = 0;
+    reg start = 0;
+    reg rirq = 0;
+    assign irq = rirq;
+    assign busy = start | fn_busy | res_unsaved;
+    reg [31:0] a_bi;
+    reg [31:0] b_bi;
+    wire [31:0] y_bo;
+    
+    func fn (
+        .clk_i      ( clk      ),
+        .rst_i      ( rst      ),
+        .start_i    ( start    ),
+        .a_bi       ( a_bi     ),
+        .b_bi       ( b_bi     ),
+        .busy_o     ( fn_busy  ),
+        .y_bo       ( y_bo     )
+    );
+
+    always @ ( posedge clk ) begin
+        if (rst) begin
+            state <= IDLE;
+            res_unsaved <= 0;
+            rbusy <= 0;
+            start <= 0;
+            rirq <= 0;
+            start <= 0;
+            rirq   <= 0;
+        end else if ( oper == `FUNC_IDLE ) begin
+            start <= 0;
+            rirq   <= 0;
+        end else case ( state )
+            IDLE: if ( oper == `FUNC_START ) begin
+                a_bi  <= srcA;
+                b_bi  <= srcB;
+                start <= 1;
+                rd_o  <= rd_i;
+                res_unsaved = 1;
+                state <= WORK;
+            end else begin
+                start <= 0;
+                result <= 0;
+                rirq   <= 0;
+            end
+            WORK: if ( !(start | fn_busy) ) begin
+                result <= y_bo;
+                state <= IDLE;
+                rirq <= 1;
+                res_unsaved <= 0; 
+            end else begin
+                start <= 0;
+            end
+ 
+        endcase
+    end
 endmodule

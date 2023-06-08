@@ -8,6 +8,9 @@
  *                        Aleksandr Romanov 
  */ 
 
+`define FUNC_IDLE   3'h0
+`define FUNC_START   3'h1
+
 //ALU commands
 `define ALU_ADD     3'b000
 `define ALU_OR      3'b001
@@ -25,6 +28,9 @@
 `define RVOP_SRL    7'b0110011
 `define RVOP_SLTU   7'b0110011
 `define RVOP_SUB    7'b0110011
+`define RVOP_BGE    7'b1100011
+`define RVOP_FUNC   7'b0101011
+`define RVPE_NOP 32'h00000013
 
 // instruction funct3
 `define RVF3_ADDI   3'b000
@@ -35,6 +41,8 @@
 `define RVF3_SRL    3'b101
 `define RVF3_SLTU   3'b011
 `define RVF3_SUB    3'b000
+`define RVF3_BGE    3'b101
+`define RVF3_FUNC   3'b000
 `define RVF3_ANY    3'b???
 
 // instruction funct7
@@ -43,5 +51,6 @@
 `define RVF7_SRL    7'b0000000
 `define RVF7_SLTU   7'b0000000
 `define RVF7_SUB    7'b0100000
+`define RVF7_FUNC   7'b0000000
 `define RVF7_ANY    7'b???????
 
